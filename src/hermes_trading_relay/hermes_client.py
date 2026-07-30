@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import subprocess
+from typing import Any
 
 from .config import RelayConfig
 from .openai_compat import ChatCompletionRequest, ChatMessage
 
 
-def _content_to_text(content: str | list[dict] | None) -> str:
+def _content_to_text(content: str | list[dict[str, Any]] | None) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
@@ -20,13 +22,55 @@ def _content_to_text(content: str | list[dict] | None) -> str:
     return "\n".join(parts)
 
 
-def messages_to_prompt(messages: list[ChatMessage], system_prefix: str) -> str:
+def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
+    names: list[str] = []
+    for tool in tools or []:
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = function.get("name")
+        if name:
+            names.append(str(name))
+    return names
+
+
+def messages_to_prompt(
+    messages: list[ChatMessage],
+    system_prefix: str,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+) -> str:
     rendered = [system_prefix.strip(), "", "OpenAI-compatible request messages:"]
     for msg in messages:
-        rendered.append(f"\n[{msg.role.upper()}]\n{_content_to_text(msg.content)}")
-    rendered.append(
-        "\nRespond as the assistant. Keep the answer compatible with a chat/completions response."
-    )
+        rendered.append(f"\n[{msg.role.upper()}]")
+        if msg.name:
+            rendered.append(f"name: {msg.name}")
+        if msg.tool_call_id:
+            rendered.append(f"tool_call_id: {msg.tool_call_id}")
+        if msg.tool_calls:
+            rendered.append("tool_calls:")
+            rendered.append(json.dumps(msg.tool_calls, ensure_ascii=False))
+        rendered.append(_content_to_text(msg.content))
+
+    if tools:
+        rendered.extend(
+            [
+                "",
+                "Tool-calling bridge instructions:",
+                "You are serving an OpenAI-compatible Chat Completions client.",
+                "The client provided tools. If a tool is needed, respond ONLY with valid JSON in this exact shape:",
+                '{"tool_calls":[{"name":"tool_name","arguments":{"arg":"value"}}]}',
+                "Use only tool names from the provided schemas. Do not wrap the JSON in markdown.",
+                "If no tool is needed, respond ONLY with valid JSON in this exact shape:",
+                '{"content":"assistant response text"}',
+                f"Tool choice requested by client: {tool_choice!r}",
+                f"Available tool names: {', '.join(_tool_names(tools))}",
+                "Tool schemas:",
+                json.dumps(tools, ensure_ascii=False),
+            ]
+        )
+    else:
+        rendered.append(
+            "\nRespond as the assistant. Keep the answer compatible with a chat/completions response."
+        )
     return "\n".join(rendered).strip()
 
 
@@ -50,7 +94,12 @@ class HermesClient:
     def complete(self, request: ChatCompletionRequest) -> str:
         if request.stream:
             raise ValueError("stream=true is not supported by hermes-trading-relay yet")
-        prompt = messages_to_prompt(request.messages, self.config.system_prefix)
+        prompt = messages_to_prompt(
+            request.messages,
+            self.config.system_prefix,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+        )
         cmd = self.build_command(prompt, request.model)
         result = subprocess.run(
             cmd,
