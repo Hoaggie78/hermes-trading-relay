@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import uuid
 from typing import Any
@@ -11,6 +12,58 @@ from fastapi import FastAPI, HTTPException
 from .config import RelayConfig
 from .hermes_client import HermesClient
 from .openai_compat import ChatCompletionRequest, ModelsResponse
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalise_tool_calls(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = parsed.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    normalised: list[dict[str, Any]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else None
+        name = call.get("name") or (function or {}).get("name")
+        arguments = call.get("arguments") if "arguments" in call else (function or {}).get("arguments", {})
+        if not name:
+            continue
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        normalised.append(
+            {
+                "id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {"name": str(name), "arguments": arguments},
+            }
+        )
+    return normalised
+
+
+def _assistant_message(raw_content: str, request: ChatCompletionRequest) -> tuple[dict[str, Any], str]:
+    parsed = _extract_json_object(raw_content) if request.tools else None
+    if parsed:
+        tool_calls = _normalise_tool_calls(parsed)
+        if tool_calls:
+            return {"role": "assistant", "content": "", "tool_calls": tool_calls}, "tool_calls"
+        if isinstance(parsed.get("content"), str):
+            return {"role": "assistant", "content": parsed["content"]}, "stop"
+    return {"role": "assistant", "content": raw_content}, "stop"
 
 
 def create_app(config: RelayConfig | None = None, client: HermesClient | None = None) -> FastAPI:
@@ -45,6 +98,7 @@ def create_app(config: RelayConfig | None = None, client: HermesClient | None = 
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         now = int(time.time())
+        message, finish_reason = _assistant_message(content, request)
         return {
             "id": f"chatcmpl-hermes-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -53,8 +107,8 @@ def create_app(config: RelayConfig | None = None, client: HermesClient | None = 
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": {

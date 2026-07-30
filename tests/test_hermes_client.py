@@ -21,6 +21,29 @@ def test_messages_to_prompt_renders_roles():
     assert "Analyze SPY." in prompt
 
 
+def test_messages_to_prompt_adds_tool_call_bridge_instructions():
+    prompt = messages_to_prompt(
+        [ChatMessage(role="user", content="Analyze SPY.")],
+        "prefix",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stock_data",
+                    "description": "Fetch stock data",
+                    "parameters": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    assert "Tool-calling bridge instructions" in prompt
+    assert "get_stock_data" in prompt
+    assert '"tool_calls"' in prompt
+    assert '"content"' in prompt
+
+
 def test_build_command_includes_profile_provider_and_model():
     cfg = RelayConfig(
         hermes_command=["hermes"],

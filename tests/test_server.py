@@ -66,3 +66,37 @@ def test_chat_completion_shape():
     assert payload["object"] == "chat.completion"
     assert payload["choices"][0]["message"]["content"] == "research-only answer"
     assert fake.requests[0].messages[0].content == "Analyze SPY"
+
+
+def test_chat_completion_can_return_openai_tool_calls():
+    fake = FakeHermesClient('{"tool_calls":[{"name":"get_stock_data","arguments":{"ticker":"SPY"}}]}')
+    app = create_app(_config(), fake)
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "hermes-codex",
+            "messages": [{"role": "user", "content": "Analyze SPY"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_stock_data",
+                        "description": "Fetch stock data",
+                        "parameters": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        },
+    )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    tool_call = choice["message"]["tool_calls"][0]
+    assert tool_call["type"] == "function"
+    assert tool_call["function"]["name"] == "get_stock_data"
+    assert tool_call["function"]["arguments"] == '{"ticker": "SPY"}'
+    assert fake.requests[0].tools[0]["function"]["name"] == "get_stock_data"
