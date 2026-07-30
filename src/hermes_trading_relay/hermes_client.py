@@ -32,6 +32,30 @@ def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
     return names
 
 
+def _summarise_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for tool in tools or []:
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        name = function.get("name")
+        if not name:
+            continue
+        parameters = function.get("parameters", {})
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        required = parameters.get("required", []) if isinstance(parameters, dict) else []
+        summary.append(
+            {
+                "name": str(name),
+                "description": str(function.get("description", ""))[:500],
+                "parameters": {
+                    key: value.get("type", "any") if isinstance(value, dict) else "any"
+                    for key, value in properties.items()
+                },
+                "required": required,
+            }
+        )
+    return summary
+
+
 def messages_to_prompt(
     messages: list[ChatMessage],
     system_prefix: str,
@@ -63,8 +87,8 @@ def messages_to_prompt(
                 '{"content":"assistant response text"}',
                 f"Tool choice requested by client: {tool_choice!r}",
                 f"Available tool names: {', '.join(_tool_names(tools))}",
-                "Tool schemas:",
-                json.dumps(tools, ensure_ascii=False),
+                "Tool schemas summary:",
+                json.dumps(_summarise_tools(tools), ensure_ascii=False),
             ]
         )
     else:
