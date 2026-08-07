@@ -44,6 +44,28 @@ def test_messages_to_prompt_adds_tool_call_bridge_instructions():
     assert '"content"' in prompt
 
 
+def test_messages_to_prompt_caps_total_length_for_windows_cli():
+    prompt = messages_to_prompt(
+        [ChatMessage(role="user", content=f"message-{idx} " + "x" * 5000) for idx in range(12)],
+        "prefix",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_stock_data",
+                    "description": "Fetch stock data" * 200,
+                    "parameters": {"type": "object", "properties": {"ticker": {"type": "string"}}},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    assert len(prompt) <= 24_500
+    assert "prompt truncated" in prompt
+    assert "Tool-calling bridge instructions" in prompt
+
+
 def test_build_command_includes_profile_provider_and_model():
     cfg = RelayConfig(
         hermes_command=["hermes"],

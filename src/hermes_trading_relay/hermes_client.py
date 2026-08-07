@@ -7,19 +7,35 @@ from typing import Any
 from .config import RelayConfig
 from .openai_compat import ChatCompletionRequest, ChatMessage
 
+MAX_MESSAGE_CHARS = 2_000
+MAX_PROMPT_CHARS = 24_000
 
-def _content_to_text(content: str | list[dict[str, Any]] | None) -> str:
+
+def _truncate_middle(text: str, max_chars: int, label: str = "content") -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = f"\n...[{label} truncated {len(text) - max_chars} chars by hermes-trading-relay]\n"
+    if max_chars <= len(marker) + 20:
+        return text[:max_chars]
+    head = max_chars // 2
+    tail = max_chars - head - len(marker)
+    return text[:head] + marker + text[-tail:]
+
+
+def _content_to_text(content: str | list[dict[str, Any]] | None, max_chars: int = MAX_MESSAGE_CHARS) -> str:
     if content is None:
         return ""
     if isinstance(content, str):
-        return content
-    parts: list[str] = []
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "text":
-            parts.append(str(item.get("text", "")))
-        elif isinstance(item, dict):
-            parts.append(str(item))
-    return "\n".join(parts)
+        text = content
+    else:
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, dict):
+                parts.append(str(item))
+        text = "\n".join(parts)
+    return _truncate_middle(text, max_chars, "message")
 
 
 def _tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
@@ -56,13 +72,8 @@ def _summarise_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]
     return summary
 
 
-def messages_to_prompt(
-    messages: list[ChatMessage],
-    system_prefix: str,
-    tools: list[dict[str, Any]] | None = None,
-    tool_choice: str | dict[str, Any] | None = None,
-) -> str:
-    rendered = [system_prefix.strip(), "", "OpenAI-compatible request messages:"]
+def _render_messages(messages: list[ChatMessage]) -> str:
+    rendered = ["OpenAI-compatible request messages:"]
     for msg in messages:
         rendered.append(f"\n[{msg.role.upper()}]")
         if msg.name:
@@ -71,31 +82,52 @@ def messages_to_prompt(
             rendered.append(f"tool_call_id: {msg.tool_call_id}")
         if msg.tool_calls:
             rendered.append("tool_calls:")
-            rendered.append(json.dumps(msg.tool_calls, ensure_ascii=False))
+            rendered.append(_truncate_middle(json.dumps(msg.tool_calls, ensure_ascii=False), MAX_MESSAGE_CHARS, "tool_calls"))
         rendered.append(_content_to_text(msg.content))
+    return "\n".join(rendered)
 
-    if tools:
-        rendered.extend(
-            [
-                "",
-                "Tool-calling bridge instructions:",
-                "You are serving an OpenAI-compatible Chat Completions client.",
-                "The client provided tools. If a tool is needed, respond ONLY with valid JSON in this exact shape:",
-                '{"tool_calls":[{"name":"tool_name","arguments":{"arg":"value"}}]}',
-                "Use only tool names from the provided schemas. Do not wrap the JSON in markdown.",
-                "If no tool is needed, respond ONLY with valid JSON in this exact shape:",
-                '{"content":"assistant response text"}',
-                f"Tool choice requested by client: {tool_choice!r}",
-                f"Available tool names: {', '.join(_tool_names(tools))}",
-                "Tool schemas summary:",
-                json.dumps(_summarise_tools(tools), ensure_ascii=False),
-            ]
-        )
-    else:
-        rendered.append(
-            "\nRespond as the assistant. Keep the answer compatible with a chat/completions response."
-        )
-    return "\n".join(rendered).strip()
+
+def _render_tool_instructions(
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None,
+) -> str:
+    if not tools:
+        return "\nRespond as the assistant. Keep the answer compatible with a chat/completions response."
+    return "\n".join(
+        [
+            "",
+            "Tool-calling bridge instructions:",
+            "You are serving an OpenAI-compatible Chat Completions client.",
+            "The client provided tools. If a tool is needed, respond ONLY with valid JSON in this exact shape:",
+            '{"tool_calls":[{"name":"tool_name","arguments":{"arg":"value"}}]}',
+            "Use only tool names from the provided schemas. Do not wrap the JSON in markdown.",
+            "If no tool is needed, respond ONLY with valid JSON in this exact shape:",
+            '{"content":"assistant response text"}',
+            f"Tool choice requested by client: {tool_choice!r}",
+            f"Available tool names: {', '.join(_tool_names(tools))}",
+            "Tool schemas summary:",
+            json.dumps(_summarise_tools(tools), ensure_ascii=False),
+        ]
+    )
+
+
+def messages_to_prompt(
+    messages: list[ChatMessage],
+    system_prefix: str,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+) -> str:
+    prefix = system_prefix.strip()
+    message_block = _render_messages(messages)
+    tool_block = _render_tool_instructions(tools, tool_choice)
+    prompt = "\n\n".join([prefix, message_block, tool_block]).strip()
+    if len(prompt) <= MAX_PROMPT_CHARS:
+        return prompt
+
+    reserved = len(prefix) + len(tool_block) + 80
+    message_budget = max(1_000, MAX_PROMPT_CHARS - reserved)
+    message_block = _truncate_middle(message_block, message_budget, "prompt truncated")
+    return "\n\n".join([prefix, message_block, tool_block]).strip()
 
 
 class HermesClient:
